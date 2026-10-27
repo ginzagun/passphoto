@@ -418,7 +418,7 @@ def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, ma
     return gallery, str(zip_path), "\n".join(log)
 
 
-with gr.Blocks(title="Pasfoto Batch", max_file_size="5gb") as demo:
+with gr.Blocks(title="Pasfoto Batch") as demo:
     gr.Markdown("## Pasfoto Batch\nUpload foto atau masukkan path folder, pilih warna & ukuran, klik **Proses**, download ZIP.")
 
     with gr.Row():
@@ -473,6 +473,6 @@ with gr.Blocks(title="Pasfoto Batch", max_file_size="5gb") as demo:
 
 if __name__ == "__main__":
     try:
-        demo.queue().launch(inbrowser=True, server_port=7860)
+        demo.queue().launch(inbrowser=True, server_port=7860, max_file_size="5gb")
     except OSError:
-        demo.queue().launch(inbrowser=True)
+        demo.queue().launch(inbrowser=True, max_file_size="5gb")
