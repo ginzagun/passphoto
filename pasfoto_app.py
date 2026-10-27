@@ -60,21 +60,23 @@ def load_image(path):
         import rawpy
 
         with rawpy.imread(str(path)) as raw:
+            # Utamakan thumbnail JPEG penuh dari ISP kamera (warna & exposure identik dengan JPG, 50x lebih cepat)
+            img = None
             try:
+                thumb = raw.extract_thumb()
+                if thumb.format == rawpy.ThumbFormat.JPEG:
+                    img = ImageOps.exif_transpose(Image.open(io.BytesIO(thumb.data)))
+            except Exception:
+                img = None
+
+            if img is None:
                 rgb = raw.postprocess(
                     use_camera_wb=True,
                     output_bps=8,
                     output_color=rawpy.ColorSpace.sRGB,
-                    no_auto_bright=False,
+                    no_auto_bright=True,
                 )
                 img = Image.fromarray(rgb)
-            except Exception:
-                # cadangan: pakai preview JPEG yang tertanam di file RAW
-                thumb = raw.extract_thumb()
-                if thumb.format == rawpy.ThumbFormat.JPEG:
-                    img = ImageOps.exif_transpose(Image.open(io.BytesIO(thumb.data)))
-                else:
-                    img = Image.fromarray(thumb.data)
         img = img.convert("RGB")
     else:
         with Image.open(path) as im:
@@ -235,8 +237,8 @@ def _lum(a):
 
 def adjust_foreground(cut, face, auto=True, strength=0.8, bright=0, warm=0):
     """Koreksi orang saja (RGBA hasil cutout), background merah tidak ikut berubah.
-    auto    : white balance dari baju putih + kecerahan wajah ke target
-    strength: 0..1 seberapa kuat koreksi otomatis
+    auto    : normalisasi warna kulit & kecerahan seragam berdasarkan deteksi kulit
+    strength: 0..1 seberapa kuat normalisasi otomatis
     bright  : -50..50 koreksi manual kecerahan
     warm    : -30..30 koreksi manual (positif = lebih hangat, negatif = lebih dingin)
     """
@@ -245,43 +247,57 @@ def adjust_foreground(cut, face, auto=True, strength=0.8, bright=0, warm=0):
     H, W = alpha.shape
     fg = alpha > 0.9
 
-    if auto and fg.sum() > 1000:
-        # --- 1. white balance: pixel terang & hampir netral di area badan ---
-        if face is not None:
-            y0 = int(face[1] + face[3] * 1.3)
-        else:
-            ys = np.where(fg.any(axis=1))[0]
-            y0 = int(ys[0] + (ys[-1] - ys[0]) * 0.5)
+    if auto and fg.sum() > 1000 and face is not None:
+        x, y, w, h = [int(v) for v in face]
+        face_rgb = rgb[max(y, 0):min(y + h, H), max(x, 0):min(x + w, W)]
+
+        if face_rgb.size > 0:
+            face_uint8 = (face_rgb * 255).astype(np.uint8)
+            ycrcb = cv2.cvtColor(face_uint8, cv2.COLOR_RGB2YCrCb)
+            # Mask kulit manusia standar di ruang warna YCrCb (kebal rambut, kerudung, mata, dan bayangan)
+            skin_mask = (
+                (ycrcb[..., 1] >= 133) & (ycrcb[..., 1] <= 173) &
+                (ycrcb[..., 2] >= 77) & (ycrcb[..., 2] <= 127)
+            )
+            face_lum = _lum(face_rgb)
+
+            if np.sum(skin_mask) > 100:
+                cur_skin = float(np.median(face_lum[skin_mask]))
+            else:
+                cur_skin = float(np.percentile(face_lum, 65))
+
+            # Target skin luminance untuk pasfoto ijazah standar (128 / 255 = ~0.50)
+            target = 0.50
+            cur_skin = np.clip(cur_skin, 0.12, 0.90)
+
+            # Hitung gamma exposure
+            g = float(np.clip(np.log(target) / np.log(cur_skin), 0.50, 1.40))
+            eff_g = 1.0 + (g - 1.0) * strength
+
+            # Tone curve midtone lift dengan proteksi bayangan/rambut (shadow anchor)
+            # agar rambut hitam tetap hitam pekat alami dan tidak menjadi abu-abu pudar
+            w_mat = np.sin(np.clip(rgb, 0.0, 1.0) * np.pi) ** 0.55
+            local_g = 1.0 + (eff_g - 1.0) * w_mat
+            rgb = np.power(np.clip(rgb, 1e-6, 1.0), local_g)
+
+        # Mild neutral white balance pada pakaian putih (jika terdeteksi stabil)
+        y0 = int(face[1] + face[3] * 1.3)
         rows = np.zeros_like(fg)
         rows[min(max(y0, 0), H - 1):, :] = True
         cand = fg & rows
         if cand.sum() > 500:
             lum = _lum(rgb)
-            thr = np.percentile(lum[cand], 80)
+            thr = np.percentile(lum[cand], 85)
             sel = cand & (lum >= thr)
             if sel.sum() > 300:
                 m = rgb[sel].mean(axis=0)
                 sat = (m.max() - m.min()) / max(m.max(), 1e-6)
-                if sat < 0.20 and m.min() > 0.25:  # benar-benar baju putih/abu
-                    gains = np.clip(m.mean() / m, 0.85, 1.15)
-                    gains = 1.0 + (gains - 1.0) * strength
+                if sat < 0.15 and m.min() > 0.40:  # benar-benar kain putih/netral
+                    gains = np.clip(m.mean() / m, 0.90, 1.10)
+                    gains = 1.0 + (gains - 1.0) * (strength * 0.5)
                     rgb = np.clip(rgb * gains, 0, 1)
 
-        # --- 2. kecerahan wajah ke target (gamma) ---
-        if face is not None:
-            x, y, w, h = [int(v) for v in face]
-            patch = rgb[
-                max(y + int(h * 0.25), 0): y + int(h * 0.85),
-                max(x + int(w * 0.20), 0): x + int(w * 0.80),
-            ]
-            if patch.size:
-                cur = float(np.clip(_lum(patch).mean(), 0.05, 0.95))
-                target = 0.55
-                g = float(np.clip(np.log(target) / np.log(cur), 0.7, 1.3))
-                g = 1.0 + (g - 1.0) * strength
-                rgb = np.power(rgb, g)
-
-    # --- 3. koreksi manual ---
+    # --- Koreksi manual (slider) ---
     if bright:
         rgb = np.power(np.clip(rgb, 0, 1), 2.0 ** (-bright / 100.0))
     if warm:
@@ -297,7 +313,6 @@ def process_one(path, bg_rgb, size, session, matting, crop_h_ratio, top_margin,
                 caption="", frame=False, auto=True, strength=0.8, bright=0, warm=0,
                 auto_zoom=True, side=0.04):
     img = load_image(path)
-    img = ImageOps.autocontrast(img, cutoff=0.5, preserve_tone=True)
 
     face = detect_face(img)
 
@@ -362,11 +377,23 @@ def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, ma
             log_folder_warn = f"Folder tidak ditemukan: {fdir}"
 
     seen = set()
-    valid_paths = []
+    raw_paths = []
     for p in paths:
         if p.suffix.lower() in EXTS and str(p) not in seen and p.exists():
             seen.add(str(p))
-            valid_paths.append(p)
+            raw_paths.append(p)
+
+    # Cegah duplikasi jika ada file RAW dan JPG untuk foto yang sama (misal _MG_8971.CR3 dan _MG_8971.JPG)
+    # Utamakan JPG untuk kecepatan decoding instan
+    stem_map = {}
+    for p in raw_paths:
+        stem = p.stem.lower()
+        if stem not in stem_map:
+            stem_map[stem] = p
+        else:
+            if stem_map[stem].suffix.lower() in RAW_EXTS and p.suffix.lower() not in RAW_EXTS:
+                stem_map[stem] = p
+    valid_paths = sorted(list(stem_map.values()), key=lambda p: p.name)
 
     if not valid_paths:
         err_msg = "Upload foto dulu atau masukkan path folder yang berisi foto (.jpg, .png, .cr3, dsb.)."
