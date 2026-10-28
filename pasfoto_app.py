@@ -7,6 +7,8 @@ Install:
     pip install -U gradio rembg onnxruntime opencv-python pillow numpy
 """
 import io
+import os
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -38,9 +40,18 @@ FONT_CANDIDATES = [
 ]
 
 _sessions = {}
-_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+def _load_cascade():
+    p = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    if os.path.exists(p):
+        return cv2.CascadeClassifier(p)
+    if getattr(sys, "frozen", False):
+        base = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(sys.executable).parent
+        alt = base / "cv2" / "data" / "haarcascade_frontalface_default.xml"
+        if alt.exists():
+            return cv2.CascadeClassifier(str(alt))
+    return cv2.CascadeClassifier(p)
+
+_cascade = _load_cascade()
 
 # Global in-memory cache untuk edit manual instan (~12ms per render tanpa rembg ulang)
 _processed_cache = {}
@@ -698,12 +709,12 @@ with gr.Blocks(title="Pasfoto Batch Studio - by @ginzagun") as demo:
             )
             folder_path = gr.Textbox(
                 label="Atau Path Folder Lokal (Opsional - sangat praktis untuk ratusan foto)",
-                placeholder="Contoh: /Users/gin2/Documents/ALWILDAN/PHOTO IJAZAH/...",
+                placeholder="Contoh: /Users/gnzn/Documents/FOTO IJAZAH/...",
             )
             warna = gr.Radio(list(COLORS), value="Merah", label="Warna background")
             custom = gr.ColorPicker(value="#DB1515", label="Warna custom (pilih 'Custom')")
             ukuran = gr.Dropdown(list(SIZES), value="4x6 cm (591x827)", label="Ukuran")
-            caption = gr.Textbox(value="SD AL-WILDAN ISLAMIC SCHOOL",
+            caption = gr.Textbox(value="Sekolah Dasar Negeri Tadika Mesra",
                                  label="Tulisan di bawah foto (kosongkan jika tidak perlu)")
             frame = gr.Checkbox(value=True, label="Bingkai putih di sekeliling foto")
             auto = gr.Checkbox(value=True,

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+*.egg-info/
+
+# PyInstaller & Build Output
+build/
+dist/
+*.spec
+
+# macOS
+.DS_Store
+
+# Temporary outputs & test images
+*.jpg
+*.zip
+*.bak
+*.CR3
+*.cr3
+*.CR2
+*.cr2
+PHOTO IJAZAH SD AW1 IKHWAN/
