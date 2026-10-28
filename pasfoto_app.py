@@ -686,8 +686,8 @@ def on_reset_edit(key):
     return new_gallery, zip_file, prev, 1.0, 0.0, 0.0, 0.0, 0, 0, stat
 
 
-with gr.Blocks(title="Pasfoto Batch") as demo:
-    gr.Markdown("## Pasfoto Batch\nUpload foto atau masukkan path folder, pilih warna & ukuran, klik **Proses**, download ZIP.")
+with gr.Blocks(title="Pasfoto Batch Studio - by @ginzagun") as demo:
+    gr.Markdown("# 📸 Pasfoto Batch Studio\n*Otomatisasi Pasfoto Ijazah & Dokumen Resmi • Developed by **gnzgn** ([@ginzagun](https://github.com/ginzagun))*")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -835,6 +835,14 @@ with gr.Blocks(title="Pasfoto Batch") as demo:
         inputs=[photo_dropdown],
         outputs=[gallery, zip_out, preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm, edit_status],
     )
+
+    gr.HTML("""
+    <div style="text-align: center; margin-top: 35px; margin-bottom: 10px; padding: 16px; border-top: 1px solid rgba(128,128,128,0.2); font-size: 13px; color: #6b7280; font-family: -apple-system, BlinkMacSystemFont, sans-serif;">
+        <span>📸 <b>Pasfoto Batch Studio</b> v1.0 &nbsp;•&nbsp; Developed by <b>gnzgn</b> (<a href="https://github.com/ginzagun" target="_blank" style="color: #2563eb; text-decoration: none; font-weight: 600;">@ginzagun</a>)</span>
+        <br>
+        <span style="font-size: 11px; opacity: 0.75; letter-spacing: 0.5px;">GINZAGUN VIDEO PRODUCTION • All Rights Reserved</span>
+    </div>
+    """)
 
 if __name__ == "__main__":
     try:
