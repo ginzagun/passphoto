@@ -708,7 +708,6 @@ with gr.Blocks(title="Pasfoto Batch") as demo:
                             label="Live Preview Hasil Edit",
                             interactive=False,
                             height=360,
-                            object_fit="contain",
                         )
                         edit_status = gr.Markdown("💡 *Pilih foto di galeri atau dropdown untuk mulai mengedit.*")
                     with gr.Column(scale=1):
