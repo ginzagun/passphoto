@@ -42,6 +42,11 @@ _cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
+# Global in-memory cache untuk edit manual instan (~12ms per render tanpa rembg ulang)
+_processed_cache = {}
+_photo_order = []
+_current_out_dir = None
+
 
 def get_session(name):
     if name not in _sessions:
@@ -108,13 +113,27 @@ def edge_touch(cut, thresh=0.04):
 
 
 def crop_pasfoto(img, face, size, fill, crop_h_ratio, top_margin, head_top=None,
-                 body=None, side=0.04, edges=(False, False, False)):
-    if face is None:
-        return ImageOps.fit(img, size, Image.LANCZOS, centering=(0.5, 0.3))
-
+                 body=None, side=0.04, edges=(False, False, False),
+                 zoom=1.0, offset_x=0.0, offset_y=0.0):
     iw, ih = img.size
-    t_left, t_right, t_bottom = edges
     ratio = size[0] / size[1]
+
+    if face is None:
+        crop_h = ih * 0.8 / max(zoom, 0.1)
+        crop_w = crop_h * ratio
+        cx = iw / 2.0 - offset_x * crop_w
+        cy = ih / 2.0 + offset_y * crop_h
+        left = cx - crop_w / 2.0
+        top = cy - crop_h / 2.0
+        right, bottom = left + crop_w, top + crop_h
+        pad = int(max(0, -left, -top, right - iw, bottom - ih)) + 1
+        if pad > 1:
+            img = ImageOps.expand(img, border=pad, fill=fill)
+            left, right, top, bottom = left + pad, right + pad, top + pad, bottom + pad
+        box = tuple(int(round(v)) for v in (left, top, right, bottom))
+        return img.crop(box).resize(size, Image.LANCZOS)
+
+    t_left, t_right, t_bottom = edges
     x, y, w, h = [int(v) for v in face]
     crop_h = h * crop_h_ratio
     crop_w = crop_h * ratio
@@ -160,6 +179,19 @@ def crop_pasfoto(img, face, size, fill, crop_h_ratio, top_margin, head_top=None,
             crop_h = new_h
             crop_w *= s
             left = clamp_x(ccx - crop_w / 2)
+
+    # Fine-tuning manual jika zoom atau offset digeser
+    if zoom != 1.0 or offset_x != 0.0 or offset_y != 0.0:
+        base_cx = left + crop_w / 2.0
+        if zoom > 0 and zoom != 1.0:
+            crop_w = crop_w / zoom
+            crop_h = crop_w / ratio
+            # Kunci margin kepala agar saat zoom in kepala tidak terpotong & baju bawah tersembunyi
+            top = head_top - top_margin * crop_h
+
+        # Geser manual (offset_x: + geser subjek ke kanan; offset_y: + geser subjek ke atas)
+        left = (base_cx - crop_w / 2.0) - offset_x * crop_w
+        top = top + offset_y * crop_h
 
     right, bottom = left + crop_w, top + crop_h
 
@@ -309,11 +341,58 @@ def adjust_foreground(cut, face, auto=True, strength=0.8, bright=0, warm=0):
     return out
 
 
+def apply_manual_grade(cut, bright=0, warm=0):
+    """Koreksi manual kecerahan dan warmth pada foreground (RGBA). Sangat cepat (~5ms)."""
+    if bright == 0 and warm == 0:
+        return cut
+    rgb = np.asarray(cut.convert("RGB")).astype(np.float32) / 255.0
+    if bright:
+        rgb = np.power(np.clip(rgb, 0, 1), 2.0 ** (-bright / 100.0))
+    if warm:
+        k = warm / 200.0
+        rgb = np.clip(rgb * np.array([1 + k, 1.0, 1 - k], dtype=np.float32), 0, 1)
+    out = Image.fromarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8), "RGB").convert("RGBA")
+    out.putalpha(cut.split()[-1])
+    return out
+
+
+def render_item(item, zoom=1.0, offset_x=0.0, offset_y=0.0, bright=0, warm=0):
+    """Render instan (~12ms) menggunakan cut_base yang sudah tersimpan tanpa panggil rembg ulang."""
+    cut_base = item["cut_base"]
+    bg_rgb = item["bg_rgb"]
+    size = item["size"]
+    face = item["face"]
+    head_top = item["head_top"]
+    body = item["body"]
+    edges = item["edges"]
+    crop_h_ratio = item["crop_h_ratio"]
+    top_margin = item["top_margin"]
+    side = item["side"]
+    frame = item["frame"]
+    caption = item["caption"]
+
+    cut = apply_manual_grade(cut_base, bright, warm)
+    bg = Image.new("RGBA", cut.size, bg_rgb + (255,))
+    result = Image.alpha_composite(bg, cut).convert("RGB")
+
+    if frame or caption:
+        m, strip, pw, ph = layout(size, frame, caption)
+        photo = crop_pasfoto(
+            result, face, (pw, ph), bg_rgb, crop_h_ratio, top_margin, head_top,
+            body, side, edges, zoom=zoom, offset_x=offset_x, offset_y=offset_y
+        )
+        return compose(photo, size, m, strip, caption)
+    else:
+        return crop_pasfoto(
+            result, face, size, bg_rgb, crop_h_ratio, top_margin, head_top,
+            body, side, edges, zoom=zoom, offset_x=offset_x, offset_y=offset_y
+        )
+
+
 def process_one(path, bg_rgb, size, session, matting, crop_h_ratio, top_margin,
                 caption="", frame=False, auto=True, strength=0.8, bright=0, warm=0,
                 auto_zoom=True, side=0.04):
     img = load_image(path)
-
     face = detect_face(img)
 
     kwargs = {}
@@ -325,25 +404,39 @@ def process_one(path, bg_rgb, size, session, matting, crop_h_ratio, top_margin,
             alpha_matting_erode_size=10,
         )
     cut = remove(img, session=session, **kwargs)
-    cut = adjust_foreground(cut, face, auto, strength, bright, warm)
+    # Simpan hasil normalisasi otomatis sebagai cut_base murni
+    cut_base = adjust_foreground(cut, face, auto=auto, strength=strength, bright=0, warm=0)
+
     # puncak kepala/hijab dari mask (lebih akurat dari perkiraan wajah)
-    mask = cut.split()[-1].point(lambda v: 255 if v > 128 else 0)
+    mask = cut_base.split()[-1].point(lambda v: 255 if v > 128 else 0)
     bbox = mask.getbbox()
     head_top = bbox[1] if bbox else None
-    body = body_extent(cut, face) if auto_zoom else None
-    edges = edge_touch(cut)
-    bg = Image.new("RGBA", cut.size, bg_rgb + (255,))
-    result = Image.alpha_composite(bg, cut).convert("RGB")
+    body = body_extent(cut_base, face) if auto_zoom else None
+    edges = edge_touch(cut_base)
 
-    if frame or caption:
-        m, strip, pw, ph = layout(size, frame, caption)
-        photo = crop_pasfoto(result, face, (pw, ph), bg_rgb, crop_h_ratio, top_margin, head_top,
-                              body, side, edges)
-        result = compose(photo, size, m, strip, caption)
-    else:
-        result = crop_pasfoto(result, face, size, bg_rgb, crop_h_ratio, top_margin, head_top,
-                              body, side, edges)
-    return result, face is not None
+    cache_data = {
+        "cut_base": cut_base,
+        "bg_rgb": bg_rgb,
+        "size": size,
+        "face": face,
+        "head_top": head_top,
+        "body": body,
+        "edges": edges,
+        "crop_h_ratio": crop_h_ratio,
+        "top_margin": top_margin,
+        "side": side,
+        "frame": frame,
+        "caption": caption,
+        "zoom": 1.0,
+        "offset_x": 0.0,
+        "offset_y": 0.0,
+        "bright": bright,
+        "warm": warm,
+        "version": 0,
+    }
+
+    result = render_item(cache_data, zoom=1.0, offset_x=0.0, offset_y=0.0, bright=bright, warm=warm)
+    return result, face is not None, cache_data
 
 
 def _extract_path(f):
@@ -361,6 +454,10 @@ def _extract_path(f):
 def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, matting,
         crop_h_ratio, top_margin, auto, strength, bright, warm, auto_zoom, side,
         progress=gr.Progress()):
+    global _processed_cache, _photo_order, _current_out_dir
+    _processed_cache.clear()
+    _photo_order.clear()
+
     paths = []
     log_folder_warn = None
 
@@ -406,6 +503,7 @@ def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, ma
     session = get_session(model)
 
     out_dir = Path(tempfile.mkdtemp(prefix="pasfoto_"))
+    _current_out_dir = out_dir
 
     gallery, log, used = [], [], set()
     if log_folder_warn:
@@ -413,7 +511,7 @@ def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, ma
 
     for p in progress.tqdm(valid_paths, desc="Memproses"):
         try:
-            result, found = process_one(
+            result, found, cache_data = process_one(
                 p, bg_rgb, size, session, matting, crop_h_ratio, top_margin,
                 caption.strip(), frame, auto, strength, bright, warm,
                 auto_zoom, side,
@@ -426,6 +524,14 @@ def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, ma
             used.add(n)
             out = out_dir / f"{n}.jpg"
             result.save(out, quality=95, subsampling=0, dpi=(300, 300))
+
+            cache_data["orig_name"] = p.name
+            cache_data["display_name"] = n
+            cache_data["out_path"] = out
+
+            _processed_cache[p.name] = cache_data
+            _photo_order.append(p.name)
+
             gallery.append((str(out), p.name))
             log.append(("OK    " if found else "OK*   ") + p.name
                        + ("" if found else "  (wajah tidak terdeteksi, crop default)"))
@@ -442,7 +548,99 @@ def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, ma
 
     ok = len(gallery)
     log.append(f"\nSelesai: {ok}/{len(valid_paths)} berhasil.")
-    return gallery, str(zip_path), "\n".join(log)
+
+    first_choice = _photo_order[0] if _photo_order else None
+    first_preview = None
+    if first_choice and first_choice in _processed_cache:
+        it = _processed_cache[first_choice]
+        first_preview = render_item(it, it["zoom"], it["offset_x"], it["offset_y"], it["bright"], it["warm"])
+
+    dropdown_update = gr.update(choices=_photo_order, value=first_choice)
+    status_update = f"💡 Foto **{first_choice}** siap diedit. Geser slider untuk mengatur posisi, zoom, atau kecerahan." if first_choice else ""
+
+    return (
+        gallery,
+        str(zip_path),
+        "\n".join(log),
+        dropdown_update,
+        first_preview,
+        1.0,
+        0.0,
+        0.0,
+        0,
+        0,
+        status_update,
+    )
+
+
+def on_gallery_select(evt: gr.SelectData):
+    if evt.index is not None and 0 <= evt.index < len(_photo_order):
+        key = _photo_order[evt.index]
+        item = _processed_cache[key]
+        prev = render_item(item, item["zoom"], item["offset_x"], item["offset_y"], item["bright"], item["warm"])
+        stat = f"🔍 Sedang mengedit: **{item['orig_name']}**"
+        return gr.update(value=key), prev, item["zoom"], item["offset_x"], item["offset_y"], item["bright"], item["warm"], stat
+    return gr.update(), None, 1.0, 0.0, 0.0, 0, 0, ""
+
+
+def on_dropdown_select(key):
+    if key and key in _processed_cache:
+        item = _processed_cache[key]
+        prev = render_item(item, item["zoom"], item["offset_x"], item["offset_y"], item["bright"], item["warm"])
+        stat = f"🔍 Sedang mengedit: **{item['orig_name']}**"
+        return prev, item["zoom"], item["offset_x"], item["offset_y"], item["bright"], item["warm"], stat
+    return None, 1.0, 0.0, 0.0, 0, 0, ""
+
+
+def on_slider_change(key, zoom, shift_x, shift_y, bright, warm):
+    if not key or key not in _processed_cache:
+        return None
+    item = _processed_cache[key]
+    return render_item(item, zoom, shift_x, shift_y, bright, warm)
+
+
+def on_apply_edit(key, zoom, shift_x, shift_y, bright, warm):
+    if not key or key not in _processed_cache:
+        return gr.update(), gr.update(), None, "⚠️ Pilih foto terlebih dahulu."
+    item = _processed_cache[key]
+    item["zoom"] = float(zoom)
+    item["offset_x"] = float(shift_x)
+    item["offset_y"] = float(shift_y)
+    item["bright"] = int(bright)
+    item["warm"] = int(warm)
+    item["version"] += 1
+
+    final_img = render_item(item, zoom, shift_x, shift_y, bright, warm)
+    out_dir = item["out_path"].parent
+    new_out = out_dir / f"{item['display_name']}_v{item['version']}.jpg"
+    final_img.save(new_out, quality=95, subsampling=0, dpi=(300, 300))
+
+    old_out = item["out_path"]
+    if old_out.exists() and old_out != new_out:
+        try:
+            old_out.unlink()
+        except Exception:
+            pass
+    item["out_path"] = new_out
+
+    # Update file ZIP
+    zip_path = out_dir / "pasfoto_hasil.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for k in _photo_order:
+            it = _processed_cache[k]
+            z.write(it["out_path"], f"{it['display_name']}.jpg")
+
+    new_gallery = [(str(_processed_cache[k]["out_path"]), _processed_cache[k]["orig_name"]) for k in _photo_order]
+    stat = f"✅ Perubahan untuk **{item['orig_name']}** berhasil disimpan & ZIP telah diperbarui!"
+    return new_gallery, str(zip_path), final_img, stat
+
+
+def on_reset_edit(key):
+    if not key or key not in _processed_cache:
+        return gr.update(), gr.update(), None, 1.0, 0.0, 0.0, 0, 0, ""
+    new_gallery, zip_file, prev, _ = on_apply_edit(key, 1.0, 0.0, 0.0, 0, 0)
+    stat = f"↺ Foto **{key}** telah direset ke posisi dan warna default."
+    return new_gallery, zip_file, prev, 1.0, 0.0, 0.0, 0, 0, stat
 
 
 with gr.Blocks(title="Pasfoto Batch") as demo:
@@ -484,18 +682,95 @@ with gr.Blocks(title="Pasfoto Batch") as demo:
                                  label="Warna manual (+ lebih hangat, - lebih dingin)")
                 side = gr.Slider(0.0, 0.15, value=0.04, step=0.005,
                                  label="Ruang kiri-kanan bahu (zoom otomatis)")
-            btn = gr.Button("Proses", variant="primary")
+            btn = gr.Button("Proses Batch", variant="primary")
 
         with gr.Column(scale=2):
-            gallery = gr.Gallery(label="Hasil", columns=4, height=480)
-            zip_out = gr.File(label="Download ZIP")
-            log = gr.Textbox(label="Log", lines=8)
+            gallery = gr.Gallery(
+                label="Hasil Pasfoto (Klik salah satu foto untuk mengedit posisi & kecerahan)",
+                columns=4,
+                height=360,
+                object_fit="contain",
+            )
 
+            with gr.Accordion("🛠️ Edit Manual Foto Terpilih (Geser Posisi, Zoom, & Kecerahan)", open=True):
+                with gr.Row():
+                    photo_dropdown = gr.Dropdown(
+                        label="Pilih Foto untuk Diedit (atau klik langsung di galeri)",
+                        choices=[],
+                        interactive=True,
+                        scale=3,
+                    )
+                    btn_reset = gr.Button("↺ Reset ke Default", variant="secondary", scale=1)
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        preview_edit = gr.Image(
+                            label="Live Preview Hasil Edit",
+                            interactive=False,
+                            height=360,
+                            object_fit="contain",
+                        )
+                        edit_status = gr.Markdown("💡 *Pilih foto di galeri atau dropdown untuk mulai mengedit.*")
+                    with gr.Column(scale=1):
+                        edit_zoom = gr.Slider(0.7, 2.2, value=1.0, step=0.02,
+                                              label="🔍 Zoom (Perbesar / Perkecil)")
+                        edit_shift_x = gr.Slider(-0.35, 0.35, value=0.0, step=0.01,
+                                                 label="↔️ Geser: Kiri (-) / Kanan (+)")
+                        edit_shift_y = gr.Slider(-0.35, 0.35, value=0.0, step=0.01,
+                                                 label="↕️ Geser: Turun (-) / Naik (+)")
+                        edit_bright = gr.Slider(-50, 50, value=0, step=1,
+                                                label="☀️ Kecerahan (+ Terang / - Gelap)")
+                        edit_warm = gr.Slider(-30, 30, value=0, step=1,
+                                              label="🎨 Warna (+ Hangat / - Dingin)")
+                        btn_apply = gr.Button("💾 Terapkan ke Foto Ini & Update ZIP", variant="primary")
+
+            zip_out = gr.File(label="Download ZIP Hasil Pasfoto")
+            log = gr.Textbox(label="Log Proses", lines=5)
+
+    # Event binding
     btn.click(
         run,
         [files, folder_path, warna, custom, ukuran, caption, frame, model, matting, crop_ratio, top_margin,
          auto, strength, bright, warm, auto_zoom, side],
-        [gallery, zip_out, log],
+        [gallery, zip_out, log, photo_dropdown, preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm, edit_status],
+    )
+
+    gallery.select(
+        on_gallery_select,
+        inputs=None,
+        outputs=[photo_dropdown, preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm, edit_status],
+    )
+
+    photo_dropdown.change(
+        on_dropdown_select,
+        inputs=[photo_dropdown],
+        outputs=[preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm, edit_status],
+    )
+
+    for slider in [edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm]:
+        slider.input(
+            on_slider_change,
+            inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm],
+            outputs=[preview_edit],
+            show_progress="hidden",
+        )
+        slider.release(
+            on_slider_change,
+            inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm],
+            outputs=[preview_edit],
+            show_progress="hidden",
+        )
+
+    btn_apply.click(
+        on_apply_edit,
+        inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm],
+        outputs=[gallery, zip_out, preview_edit, edit_status],
+    )
+
+    btn_reset.click(
+        on_reset_edit,
+        inputs=[photo_dropdown],
+        outputs=[gallery, zip_out, preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm, edit_status],
     )
 
 if __name__ == "__main__":
