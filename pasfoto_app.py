@@ -356,7 +356,7 @@ def apply_manual_grade(cut, bright=0, warm=0):
     return out
 
 
-def render_item(item, zoom=1.0, offset_x=0.0, offset_y=0.0, bright=0, warm=0):
+def render_item(item, zoom=1.0, offset_x=0.0, offset_y=0.0, rotate=0.0, bright=0, warm=0):
     """Render instan (~12ms) menggunakan cut_base yang sudah tersimpan tanpa panggil rembg ulang."""
     cut_base = item["cut_base"]
     bg_rgb = item["bg_rgb"]
@@ -372,26 +372,42 @@ def render_item(item, zoom=1.0, offset_x=0.0, offset_y=0.0, bright=0, warm=0):
     caption = item["caption"]
 
     cut = apply_manual_grade(cut_base, bright, warm)
+
+    # Rotasi / luruskan kepala & badan (pusat rotasi di tengah wajah agar posisi tetap stabil)
+    rot_head_top = head_top
+    if rotate != 0.0:
+        if face is not None:
+            fcx = face[0] + face[2] / 2.0
+            fcy = face[1] + face[3] / 2.0
+        else:
+            fcx = cut.width / 2.0
+            fcy = cut.height / 2.0
+
+        cut = cut.rotate(-rotate, resample=Image.BICUBIC, center=(fcx, fcy))
+        if head_top is not None:
+            dist = abs(head_top - fcy)
+            rot_head_top = fcy - dist
+
     bg = Image.new("RGBA", cut.size, bg_rgb + (255,))
     result = Image.alpha_composite(bg, cut).convert("RGB")
 
     if frame or caption:
         m, strip, pw, ph = layout(size, frame, caption)
         photo = crop_pasfoto(
-            result, face, (pw, ph), bg_rgb, crop_h_ratio, top_margin, head_top,
+            result, face, (pw, ph), bg_rgb, crop_h_ratio, top_margin, rot_head_top,
             body, side, edges, zoom=zoom, offset_x=offset_x, offset_y=offset_y
         )
         return compose(photo, size, m, strip, caption)
     else:
         return crop_pasfoto(
-            result, face, size, bg_rgb, crop_h_ratio, top_margin, head_top,
+            result, face, size, bg_rgb, crop_h_ratio, top_margin, rot_head_top,
             body, side, edges, zoom=zoom, offset_x=offset_x, offset_y=offset_y
         )
 
 
 def process_one(path, bg_rgb, size, session, matting, crop_h_ratio, top_margin,
                 caption="", frame=False, auto=True, strength=0.8, bright=0, warm=0,
-                auto_zoom=True, side=0.04):
+                auto_zoom=True, side=0.04, rotate=0.0):
     img = load_image(path)
     face = detect_face(img)
 
@@ -430,12 +446,13 @@ def process_one(path, bg_rgb, size, session, matting, crop_h_ratio, top_margin,
         "zoom": 1.0,
         "offset_x": 0.0,
         "offset_y": 0.0,
+        "rotate": float(rotate),
         "bright": bright,
         "warm": warm,
         "version": 0,
     }
 
-    result = render_item(cache_data, zoom=1.0, offset_x=0.0, offset_y=0.0, bright=bright, warm=warm)
+    result = render_item(cache_data, zoom=1.0, offset_x=0.0, offset_y=0.0, rotate=rotate, bright=bright, warm=warm)
     return result, face is not None, cache_data
 
 
@@ -453,7 +470,7 @@ def _extract_path(f):
 
 def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, matting,
         crop_h_ratio, top_margin, auto, strength, bright, warm, auto_zoom, side,
-        progress=gr.Progress()):
+        rotate_batch=0.0, progress=gr.Progress()):
     global _processed_cache, _photo_order, _current_out_dir
     _processed_cache.clear()
     _photo_order.clear()
@@ -514,7 +531,7 @@ def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, ma
             result, found, cache_data = process_one(
                 p, bg_rgb, size, session, matting, crop_h_ratio, top_margin,
                 caption.strip(), frame, auto, strength, bright, warm,
-                auto_zoom, side,
+                auto_zoom, side, rotate=float(rotate_batch),
             )
             name = f"{p.stem}_{warna.lower()}"
             n, k = name, 1
@@ -551,12 +568,14 @@ def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, ma
 
     first_choice = _photo_order[0] if _photo_order else None
     first_preview = None
+    first_rot = float(rotate_batch)
     if first_choice and first_choice in _processed_cache:
         it = _processed_cache[first_choice]
-        first_preview = render_item(it, it["zoom"], it["offset_x"], it["offset_y"], it["bright"], it["warm"])
+        first_rot = it["rotate"]
+        first_preview = render_item(it, it["zoom"], it["offset_x"], it["offset_y"], it["rotate"], it["bright"], it["warm"])
 
     dropdown_update = gr.update(choices=_photo_order, value=first_choice)
-    status_update = f"💡 Foto **{first_choice}** siap diedit. Geser slider untuk mengatur posisi, zoom, atau kecerahan." if first_choice else ""
+    status_update = f"💡 Foto **{first_choice}** siap diedit. Geser slider untuk mengatur posisi, zoom, rotasi, atau kecerahan." if first_choice else ""
 
     return (
         gallery,
@@ -567,6 +586,7 @@ def run(files, folder_path, warna, custom_hex, ukuran, caption, frame, model, ma
         1.0,
         0.0,
         0.0,
+        first_rot,
         0,
         0,
         status_update,
@@ -577,40 +597,63 @@ def on_gallery_select(evt: gr.SelectData):
     if evt.index is not None and 0 <= evt.index < len(_photo_order):
         key = _photo_order[evt.index]
         item = _processed_cache[key]
-        prev = render_item(item, item["zoom"], item["offset_x"], item["offset_y"], item["bright"], item["warm"])
+        prev = render_item(item, item["zoom"], item["offset_x"], item["offset_y"], item["rotate"], item["bright"], item["warm"])
         stat = f"🔍 Sedang mengedit: **{item['orig_name']}**"
-        return gr.update(value=key), prev, item["zoom"], item["offset_x"], item["offset_y"], item["bright"], item["warm"], stat
-    return gr.update(), None, 1.0, 0.0, 0.0, 0, 0, ""
+        return gr.update(value=key), prev, item["zoom"], item["offset_x"], item["offset_y"], item["rotate"], item["bright"], item["warm"], stat
+    return gr.update(), None, 1.0, 0.0, 0.0, 0.0, 0, 0, ""
 
 
 def on_dropdown_select(key):
     if key and key in _processed_cache:
         item = _processed_cache[key]
-        prev = render_item(item, item["zoom"], item["offset_x"], item["offset_y"], item["bright"], item["warm"])
+        prev = render_item(item, item["zoom"], item["offset_x"], item["offset_y"], item["rotate"], item["bright"], item["warm"])
         stat = f"🔍 Sedang mengedit: **{item['orig_name']}**"
-        return prev, item["zoom"], item["offset_x"], item["offset_y"], item["bright"], item["warm"], stat
-    return None, 1.0, 0.0, 0.0, 0, 0, ""
+        return prev, item["zoom"], item["offset_x"], item["offset_y"], item["rotate"], item["bright"], item["warm"], stat
+    return None, 1.0, 0.0, 0.0, 0.0, 0, 0, ""
 
 
-def on_slider_change(key, zoom, shift_x, shift_y, bright, warm):
+def on_slider_change(key, zoom, shift_x, shift_y, rotate, bright, warm):
     if not key or key not in _processed_cache:
         return None
     item = _processed_cache[key]
-    return render_item(item, zoom, shift_x, shift_y, bright, warm)
+    return render_item(item, zoom, shift_x, shift_y, rotate, bright, warm)
 
 
-def on_apply_edit(key, zoom, shift_x, shift_y, bright, warm):
+def on_rotate_step_ccw(key, zoom, shift_x, shift_y, current_rot, bright, warm):
+    new_rot = round(float(current_rot) - 90.0, 1)
+    if new_rot < -180.0:
+        new_rot += 360.0
+    if not key or key not in _processed_cache:
+        return new_rot, None
+    item = _processed_cache[key]
+    prev = render_item(item, zoom, shift_x, shift_y, new_rot, bright, warm)
+    return new_rot, prev
+
+
+def on_rotate_step_cw(key, zoom, shift_x, shift_y, current_rot, bright, warm):
+    new_rot = round(float(current_rot) + 90.0, 1)
+    if new_rot > 180.0:
+        new_rot -= 360.0
+    if not key or key not in _processed_cache:
+        return new_rot, None
+    item = _processed_cache[key]
+    prev = render_item(item, zoom, shift_x, shift_y, new_rot, bright, warm)
+    return new_rot, prev
+
+
+def on_apply_edit(key, zoom, shift_x, shift_y, rotate, bright, warm):
     if not key or key not in _processed_cache:
         return gr.update(), gr.update(), None, "⚠️ Pilih foto terlebih dahulu."
     item = _processed_cache[key]
     item["zoom"] = float(zoom)
     item["offset_x"] = float(shift_x)
     item["offset_y"] = float(shift_y)
+    item["rotate"] = float(rotate)
     item["bright"] = int(bright)
     item["warm"] = int(warm)
     item["version"] += 1
 
-    final_img = render_item(item, zoom, shift_x, shift_y, bright, warm)
+    final_img = render_item(item, zoom, shift_x, shift_y, rotate, bright, warm)
     out_dir = item["out_path"].parent
     new_out = out_dir / f"{item['display_name']}_v{item['version']}.jpg"
     final_img.save(new_out, quality=95, subsampling=0, dpi=(300, 300))
@@ -637,10 +680,10 @@ def on_apply_edit(key, zoom, shift_x, shift_y, bright, warm):
 
 def on_reset_edit(key):
     if not key or key not in _processed_cache:
-        return gr.update(), gr.update(), None, 1.0, 0.0, 0.0, 0, 0, ""
-    new_gallery, zip_file, prev, _ = on_apply_edit(key, 1.0, 0.0, 0.0, 0, 0)
-    stat = f"↺ Foto **{key}** telah direset ke posisi dan warna default."
-    return new_gallery, zip_file, prev, 1.0, 0.0, 0.0, 0, 0, stat
+        return gr.update(), gr.update(), None, 1.0, 0.0, 0.0, 0.0, 0, 0, ""
+    new_gallery, zip_file, prev, _ = on_apply_edit(key, 1.0, 0.0, 0.0, 0.0, 0, 0)
+    stat = f"↺ Foto **{key}** telah direset ke posisi, sudut, dan warna default."
+    return new_gallery, zip_file, prev, 1.0, 0.0, 0.0, 0.0, 0, 0, stat
 
 
 with gr.Blocks(title="Pasfoto Batch") as demo:
@@ -676,6 +719,8 @@ with gr.Blocks(title="Pasfoto Batch") as demo:
                                        label="Jarak puncak kepala ke tepi atas")
                 strength = gr.Slider(0.0, 1.0, value=0.8, step=0.05,
                                      label="Kekuatan koreksi otomatis")
+                rotate_batch = gr.Slider(-180.0, 180.0, value=0.0, step=0.5,
+                                         label="Rotasi awal seluruh batch (- Kiri / + Kanan)")
                 bright = gr.Slider(-50, 50, value=0, step=1,
                                    label="Kecerahan manual (+ lebih terang)")
                 warm = gr.Slider(-30, 30, value=0, step=1,
@@ -686,13 +731,13 @@ with gr.Blocks(title="Pasfoto Batch") as demo:
 
         with gr.Column(scale=2):
             gallery = gr.Gallery(
-                label="Hasil Pasfoto (Klik salah satu foto untuk mengedit posisi & kecerahan)",
+                label="Hasil Pasfoto (Klik salah satu foto untuk mengedit posisi, sudut & kecerahan)",
                 columns=4,
                 height=360,
                 object_fit="contain",
             )
 
-            with gr.Accordion("🛠️ Edit Manual Foto Terpilih (Geser Posisi, Zoom, & Kecerahan)", open=True):
+            with gr.Accordion("🛠️ Edit Manual Foto Terpilih (Geser Posisi, Zoom, Rotasi, & Kecerahan)", open=True):
                 with gr.Row():
                     photo_dropdown = gr.Dropdown(
                         label="Pilih Foto untuk Diedit (atau klik langsung di galeri)",
@@ -717,6 +762,11 @@ with gr.Blocks(title="Pasfoto Batch") as demo:
                                                  label="↔️ Geser: Kiri (-) / Kanan (+)")
                         edit_shift_y = gr.Slider(-0.35, 0.35, value=0.0, step=0.01,
                                                  label="↕️ Geser: Turun (-) / Naik (+)")
+                        with gr.Row():
+                            edit_rotate = gr.Slider(-180.0, 180.0, value=0.0, step=0.5,
+                                                    label="🔄 Rotasi / Luruskan (- Kiri / + Kanan)", scale=3)
+                            btn_rot_ccw = gr.Button("↺ -90°", variant="secondary", scale=1, min_width=55)
+                            btn_rot_cw = gr.Button("↻ +90°", variant="secondary", scale=1, min_width=55)
                         edit_bright = gr.Slider(-50, 50, value=0, step=1,
                                                 label="☀️ Kecerahan (+ Terang / - Gelap)")
                         edit_warm = gr.Slider(-30, 30, value=0, step=1,
@@ -730,46 +780,60 @@ with gr.Blocks(title="Pasfoto Batch") as demo:
     btn.click(
         run,
         [files, folder_path, warna, custom, ukuran, caption, frame, model, matting, crop_ratio, top_margin,
-         auto, strength, bright, warm, auto_zoom, side],
-        [gallery, zip_out, log, photo_dropdown, preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm, edit_status],
+         auto, strength, bright, warm, auto_zoom, side, rotate_batch],
+        [gallery, zip_out, log, photo_dropdown, preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm, edit_status],
     )
 
     gallery.select(
         on_gallery_select,
         inputs=None,
-        outputs=[photo_dropdown, preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm, edit_status],
+        outputs=[photo_dropdown, preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm, edit_status],
     )
 
     photo_dropdown.change(
         on_dropdown_select,
         inputs=[photo_dropdown],
-        outputs=[preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm, edit_status],
+        outputs=[preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm, edit_status],
     )
 
-    for slider in [edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm]:
+    for slider in [edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm]:
         slider.input(
             on_slider_change,
-            inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm],
+            inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm],
             outputs=[preview_edit],
             show_progress="hidden",
         )
         slider.release(
             on_slider_change,
-            inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm],
+            inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm],
             outputs=[preview_edit],
             show_progress="hidden",
         )
 
+    btn_rot_ccw.click(
+        on_rotate_step_ccw,
+        inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm],
+        outputs=[edit_rotate, preview_edit],
+        show_progress="hidden",
+    )
+
+    btn_rot_cw.click(
+        on_rotate_step_cw,
+        inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm],
+        outputs=[edit_rotate, preview_edit],
+        show_progress="hidden",
+    )
+
     btn_apply.click(
         on_apply_edit,
-        inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm],
+        inputs=[photo_dropdown, edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm],
         outputs=[gallery, zip_out, preview_edit, edit_status],
     )
 
     btn_reset.click(
         on_reset_edit,
         inputs=[photo_dropdown],
-        outputs=[gallery, zip_out, preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_bright, edit_warm, edit_status],
+        outputs=[gallery, zip_out, preview_edit, edit_zoom, edit_shift_x, edit_shift_y, edit_rotate, edit_bright, edit_warm, edit_status],
     )
 
 if __name__ == "__main__":
